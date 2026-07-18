@@ -33,15 +33,6 @@ CREATE TABLE IF NOT EXISTS produtores (
 );
 CREATE INDEX IF NOT EXISTS idx_produtores_ident ON produtores(identificador);
 
--- Favoritos: técnico salvo pelo produtor (N:N)
-CREATE TABLE IF NOT EXISTS produtor_favoritos (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  produtor_id  INTEGER NOT NULL REFERENCES produtores(id) ON DELETE CASCADE,
-  tecnico_id   INTEGER NOT NULL REFERENCES tecnicos(id)   ON DELETE CASCADE,
-  criado_em    TEXT    NOT NULL DEFAULT (datetime('now')),
-  UNIQUE(produtor_id, tecnico_id)
-);
-
 -- ══════════════════════════════════════════════════════════════════
 -- TÉCNICOS
 -- ══════════════════════════════════════════════════════════════════
@@ -120,6 +111,17 @@ CREATE TABLE IF NOT EXISTS tecnico_sessoes (
   expira_em   TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tecnico_sessoes_tecnico ON tecnico_sessoes(tecnico_id);
+
+-- ══════════════════════════════════════════════════════════════════
+-- FAVORITOS (depende de produtores E tecnicos — só pode vir depois dos dois)
+-- ══════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS produtor_favoritos (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  produtor_id  INTEGER NOT NULL REFERENCES produtores(id) ON DELETE CASCADE,
+  tecnico_id   INTEGER NOT NULL REFERENCES tecnicos(id)   ON DELETE CASCADE,
+  criado_em    TEXT    NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(produtor_id, tecnico_id)
+);
 
 -- ══════════════════════════════════════════════════════════════════
 -- PAGAMENTOS (Premium + Classificados)

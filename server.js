@@ -105,13 +105,23 @@ if (!MP_ACCESS_TOKEN) {
 // Confirma no boot qual driver de banco está ativo e que o schema
 // rodou sem erros — evita descobrir problema de conexão só quando a
 // primeira rota migrada (subtópico 4.2) for chamada em produção.
-try {
+//
+// IMPORTANTE: db.query() é SÍNCRONO no driver SQLite (better-sqlite3),
+// mas ASSÍNCRONO no driver Postgres (retorna Promise). Promise.resolve()
+// normaliza os dois casos — sem isso, um `db.query(...)` sem await aqui
+// faria essa checagem "passar" mesmo com o Postgres inacessível, e o
+// erro real só apareceria depois como uma promise rejeitada sem handler
+// (crash confuso e atrasado, não uma falha clara no boot).
+{
   const driverAtivo = process.env.DATABASE_URL ? 'PostgreSQL (produção)' : 'SQLite (MVP)';
-  db.query('SELECT 1 as ok');
-  console.log(`[db] Conexão validada no boot — driver: ${driverAtivo}`);
-} catch (err) {
-  console.error('[ERRO FATAL] Falha ao conectar/inicializar o banco de dados:', err?.message || err);
-  process.exit(1);
+  Promise.resolve(db.query('SELECT 1 as ok'))
+    .then(() => {
+      console.log(`[db] Conexão validada no boot — driver: ${driverAtivo}`);
+    })
+    .catch(err => {
+      console.error('[ERRO FATAL] Falha ao conectar/inicializar o banco de dados:', err?.message || err);
+      process.exit(1);
+    });
 }
 
 // CONTATO_ENC_KEY é exigida apenas a partir do subtópico 4.5 (demandas),
@@ -161,10 +171,10 @@ function hashSenha(senha) {
  * a tabela admin_sessoes. Mantém compatibilidade com Bearer token para
  * transição suave (ex.: scripts internos que ainda usam ADMIN_TOKEN).
  */
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
   // 1. Tenta cookie HttpOnly (sistema principal)
   const cookieToken = req.cookies?.agro_admin_sess;
-  if (cookieToken && AdminSessoes.validar(cookieToken)) {
+  if (cookieToken && await AdminSessoes.validar(cookieToken)) {
     return next();
   }
 
@@ -204,10 +214,10 @@ const TECNICO_SESS_TTL = 8 * 60 * 60 * 1000; // 8 horas em ms — mantido em sin
  * gerado pelo POST /api/v1/tecnico/login contra o banco de dados.
  * Injeta req.tecnicoSessao = { tecnicoId }.
  */
-function requireTecnico(req, res, next) {
+async function requireTecnico(req, res, next) {
   const cookieToken = req.cookies?.agro_tec_sess;
   if (cookieToken) {
-    const sessao = TecnicoSessoes.validar(cookieToken);
+    const sessao = await TecnicoSessoes.validar(cookieToken);
     if (sessao) {
       req.tecnicoSessao = sessao;
       return next();
@@ -255,7 +265,7 @@ const PRECOS_PADRAO = { premium: 49.90, classificado: 29.90 };
  */
 async function precosCfgLer() {
   try {
-    return Configuracoes.precos();
+    return await Configuracoes.precos();
   } catch (err) {
     console.error('[precosCfgLer] Falha ao ler do banco, usando padrão:', err?.message);
     return { ...PRECOS_PADRAO };
@@ -266,7 +276,7 @@ async function precosCfgLer() {
  * Persiste os preços na tabela `configuracoes`.
  */
 async function precosCfgSalvar(premium, classificado) {
-  Configuracoes.definirPrecos(premium, classificado);
+  await Configuracoes.definirPrecos(premium, classificado);
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -395,6 +405,14 @@ const upload = multer({
 // ── App Express ───────────────────────────────────────────────────
 const app = express();
 
+// Render (e a maioria dos PaaS) coloca o app atrás de um proxy reverso
+// que repassa o IP real do usuário via X-Forwarded-For. Sem isso,
+// req.ip SEMPRE retorna o IP interno do proxy — quebrando o rate
+// limiting e as proteções "1x por dia por IP" (avaliação, denúncia),
+// já que todo mundo apareceria como o mesmo IP. `1` = confia em
+// exatamente 1 hop de proxy à frente, que é o que o Render usa.
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(cookieParser()); // necessário para ler req.cookies.agro_admin_sess
 
@@ -459,10 +477,10 @@ async function registrarPremiumMVP(identificador, pagamentoId, tecnicoIdParam = 
   // a fonte de verdade); fallback para o técnico já vinculado ao registro
   // pendente criado em criar-pix/criar-cartao; último fallback: busca por
   // e-mail/whatsapp — cobre registros legados sem tecnicoId.
-  const registroExistente = Pagamentos.buscarPorMpId(pagamentoId);
+  const registroExistente = await Pagamentos.buscarPorMpId(pagamentoId);
   let tecnicoId = tecnicoIdParam || registroExistente?.tecnico_id || null;
   if (!tecnicoId) {
-    const tec = Tecnicos.buscarPorIdentificador(identificador);
+    const tec = await Tecnicos.buscarPorIdentificador(identificador);
     if (tec) tecnicoId = tec.id;
   }
 
@@ -471,7 +489,7 @@ async function registrarPremiumMVP(identificador, pagamentoId, tecnicoIdParam = 
   // criarPendente ter sido chamado (ex.: retry do Mercado Pago).
   if (!registroExistente) {
     const precoAtual = await precosCfgLer();
-    Pagamentos.criarPendente({
+    await Pagamentos.criarPendente({
       pagamentoIdMp: pagamentoId,
       identificador,
       tecnicoId,
@@ -480,21 +498,21 @@ async function registrarPremiumMVP(identificador, pagamentoId, tecnicoIdParam = 
     });
   }
 
-  const { desbloqueioToken } = Pagamentos.aprovar(pagamentoId, { tecnicoId });
+  const { desbloqueioToken } = await Pagamentos.aprovar(pagamentoId, { tecnicoId });
 
   if (tecnicoId) {
-    Tecnicos.ativarPremiumPorId(tecnicoId, pagamentoId);
+    await Tecnicos.ativarPremiumPorId(tecnicoId, pagamentoId);
   } else {
     // Sem vínculo de técnico conhecido — mantém o fallback legado por
     // e-mail/whatsapp para o pagamento não ficar aprovado sem efeito.
-    Tecnicos.ativarPremium(identificador, pagamentoId);
+    await Tecnicos.ativarPremium(identificador, pagamentoId);
   }
 
   console.log(`[MVP] Premium registrado → ${identificador} | tecnicoId: ${tecnicoId} | paymentId: ${pagamentoId} | desbloqueioToken: ${desbloqueioToken}`);
 }
 
 async function verificarSePagamentoJaFoiAtivado(paymentId) {
-  return Pagamentos.jaAtivado(paymentId);
+  return await Pagamentos.jaAtivado(paymentId);
 }
 
 /**
@@ -622,7 +640,7 @@ app.post('/api/v1/pagamentos/criar-pix', limiterPix, async (req, res) => {
     // aprovação. Dá ao webhook uma linha já existente para atualizar
     // (em vez de criar do zero) e permite consultar status mesmo antes
     // do pagamento ser confirmado.
-    Pagamentos.criarPendente({
+    await Pagamentos.criarPendente({
       pagamentoIdMp: pagamento.id,
       identificador,
       tecnicoId: tecnicoId || null,
@@ -690,7 +708,7 @@ app.post('/api/v1/pagamentos/criar-pix-classificado', limiterPix, async (req, re
     const qr = pagamento.point_of_interaction?.transaction_data;
     console.log(`[classificado] id: ${pagamento.id} | valor: R$ ${VALOR} | ident: ${identificador}`);
 
-    Pagamentos.criarPendente({
+    await Pagamentos.criarPendente({
       pagamentoIdMp: pagamento.id,
       identificador,
       tecnicoId: null, // classificados não têm vínculo com tecnicos.id
@@ -939,7 +957,7 @@ app.post('/api/v1/pagamentos/criar-cartao', limiterPix, async (req, res) => {
 // Por paymentId (seguro — confirmação via webhook)
 app.get('/api/v1/pagamentos/status/id/:paymentId', async (req, res) => {
   try {
-    const registro = Pagamentos.statusPorId(req.params.paymentId);
+    const registro = await Pagamentos.statusPorId(req.params.paymentId);
     const aprovado = registro?.status === 'approved';
 
     res.json({
@@ -959,7 +977,7 @@ app.get('/api/v1/pagamentos/status/id/:paymentId', async (req, res) => {
 // Por identificador (legado/fallback)
 app.get('/api/v1/pagamentos/status/:identificador', async (req, res) => {
   try {
-    const registro = Pagamentos.statusPorIdentificador(req.params.identificador);
+    const registro = await Pagamentos.statusPorIdentificador(req.params.identificador);
     res.json({
       premium:    registro?.status === 'approved',
       ativado_em: registro?.aprovado_em || null,
@@ -1109,7 +1127,7 @@ app.post('/api/v1/tecnicos/cadastrar', limiterCad, async (req, res) => {
     // db.js (Tecnicos.criar) cuida de: gerar public_id único consultando
     // o banco, gerar o upload_token (prova de posse) e hashear o CPF —
     // nada disso fica mais em memória de processo único (Set/JSON).
-    const { id, publicId, uploadToken } = Tecnicos.criar({
+    const { id, publicId, uploadToken } = await Tecnicos.criar({
       nome:           san(nome, 100),
       whatsapp:       (whatsapp||'').replace(/\D/g, '').slice(0,11),
       email:          san(email, 150).toLowerCase() || null,
@@ -1141,7 +1159,7 @@ app.post('/api/v1/tecnicos/:id/documento', upload.single('documento'), async (re
     if (!req.file) return res.status(400).json({ erro: 'Nenhum arquivo enviado.' });
 
     const idNum = Number(req.params.id);
-    const tecnico = Number.isInteger(idNum) ? Tecnicos.buscarPorId(idNum) : null;
+    const tecnico = Number.isInteger(idNum) ? await Tecnicos.buscarPorId(idNum) : null;
     if (!tecnico) {
       // Arquivo já salvo pelo Multer — remove antes de retornar erro
       await fs.unlink(req.file.path).catch(() => {});
@@ -1149,7 +1167,7 @@ app.post('/api/v1/tecnicos/:id/documento', upload.single('documento'), async (re
     }
 
     const tokenRecebido = req.headers['x-upload-token'] || req.body?.uploadToken || '';
-    if (!Tecnicos.verificarUploadToken(idNum, tokenRecebido)) {
+    if (!await Tecnicos.verificarUploadToken(idNum, tokenRecebido)) {
       // Remove o arquivo para não deixar lixo em disco
       await fs.unlink(req.file.path).catch(() => {});
       return res.status(403).json({ erro: 'Não autorizado a enviar documento para este técnico.' });
@@ -1169,7 +1187,7 @@ app.post('/api/v1/tecnicos/:id/documento', upload.single('documento'), async (re
     }
     // ────────────────────────────────────────────────────────────────
 
-    Tecnicos.salvarDocumento(idNum, {
+    await Tecnicos.salvarDocumento(idNum, {
       docPath:         req.file.filename,
       docOriginalName: req.file.originalname,
       docMime:         req.file.mimetype,
@@ -1198,10 +1216,10 @@ const PORTAIS_CONSELHO = {
 app.post('/api/v1/admin/tecnicos/:id/validar', requireAdmin, async (req, res) => {
   try {
     const idNum = Number(req.params.id);
-    const tecnico = Number.isInteger(idNum) ? Tecnicos.buscarPorId(idNum) : null;
+    const tecnico = Number.isInteger(idNum) ? await Tecnicos.buscarPorId(idNum) : null;
     if (!tecnico) return res.status(404).json({ erro: 'Técnico não encontrado.' });
 
-    Tecnicos.atualizarStatus(idNum, 'ativo', req.body.adminNome || 'admin');
+    await Tecnicos.atualizarStatus(idNum, 'ativo', req.body.adminNome || 'admin');
     console.log(`[validar] ${tecnico.nome} (${tecnico.registro_completo}) ativado.`);
 
     res.json({ id: idNum, statusValidacao: 'ativo', registroCompleto: tecnico.registro_completo, mensagem: 'Técnico validado e liberado no marketplace.' });
@@ -1219,11 +1237,11 @@ app.post('/api/v1/admin/tecnicos/:id/status', requireAdmin, async (req, res) => 
 
   try {
     const idNum = Number(req.params.id);
-    const tecnico = Number.isInteger(idNum) ? Tecnicos.buscarPorId(idNum) : null;
+    const tecnico = Number.isInteger(idNum) ? await Tecnicos.buscarPorId(idNum) : null;
     if (!tecnico) return res.status(404).json({ erro: 'Técnico não encontrado.' });
 
     const ant = tecnico.status;
-    Tecnicos.atualizarStatus(idNum, req.body.status, req.body.adminNome || 'admin');
+    await Tecnicos.atualizarStatus(idNum, req.body.status, req.body.adminNome || 'admin');
     console.log(`[status] ${tecnico.nome}: ${ant} → ${req.body.status}`);
     res.json({ id: idNum, statusAnterior: ant, statusAtual: req.body.status });
 
@@ -1235,7 +1253,7 @@ app.post('/api/v1/admin/tecnicos/:id/status', requireAdmin, async (req, res) => 
 
 app.get('/api/v1/admin/tecnicos/pendentes', requireAdmin, async (req, res) => {
   try {
-    const pendentes = Tecnicos.listarPendentes()
+    const pendentes = (await Tecnicos.listarPendentes())
       .map(t => ({ ...t, portalConselho: PORTAIS_CONSELHO[t.conselho] || null }));
 
     res.json({ total: pendentes.length, pendentes });
@@ -1271,11 +1289,11 @@ app.post('/api/v1/denuncias', limiterDen, async (req, res) => {
 
     const ip = req.ip || req.socket?.remoteAddress || 'desconhecido';
 
-    if (Denuncias.jaDenounciouHoje(idNum, motivo, ip)) {
+    if (await Denuncias.jaDenounciouHoje(idNum, motivo, ip)) {
       return res.status(429).json({ erro: 'Você já registrou esta denúncia nas últimas 24h.' });
     }
 
-    const info = Denuncias.criar({
+    const info = await Denuncias.criar({
       tecnicoId:   idNum,
       tecnicoNome: tecnicoNome || 'Desconhecido',
       motivo,
@@ -1288,8 +1306,8 @@ app.post('/api/v1/denuncias', limiterDen, async (req, res) => {
     // para o mesmo técnico suspendem imediatamente, sem esperar
     // moderação manual — mesma regra do MVP original.
     let autoSuspenso = false;
-    if (motivo === 'falso_profissional' && Denuncias.contarFalsosProfissionais(idNum) >= 3) {
-      Tecnicos.suspenderAutomaticamente(idNum);
+    if (motivo === 'falso_profissional' && await Denuncias.contarFalsosProfissionais(idNum) >= 3) {
+      await Tecnicos.suspenderAutomaticamente(idNum);
       autoSuspenso = true;
       console.warn(`[segurança] ⚠ AUTO-SUSPENSÃO: ${tecnicoNome || idNum} — 3+ denúncias de Falso Profissional`);
     }
@@ -1310,7 +1328,7 @@ app.post('/api/v1/denuncias', limiterDen, async (req, res) => {
 
 app.post('/api/v1/denuncias/:id/ignorar', requireAdmin, async (req, res) => {
   try {
-    Denuncias.arquivar(Number(req.params.id), 'ignorada', req.body?.adminNome || 'admin');
+    await Denuncias.arquivar(Number(req.params.id), 'ignorada', req.body?.adminNome || 'admin');
     res.json({ ok: true });
   } catch (err) {
     console.error('[denuncia/ignorar] Erro:', err?.message || err);
@@ -1322,9 +1340,9 @@ app.post('/api/v1/denuncias/:id/suspender', requireAdmin, async (req, res) => {
   try {
     const idNum = Number(req.body?.tecnicoId);
     if (Number.isInteger(idNum)) {
-      Tecnicos.atualizarStatus(idNum, 'suspenso', req.body?.adminNome || 'admin');
+      await Tecnicos.atualizarStatus(idNum, 'suspenso', req.body?.adminNome || 'admin');
     }
-    Denuncias.arquivar(Number(req.params.id), 'suspenso', req.body?.adminNome || 'admin');
+    await Denuncias.arquivar(Number(req.params.id), 'suspenso', req.body?.adminNome || 'admin');
     console.log(`[denúncia] ${req.body?.tecnicoId} suspenso por moderação manual`);
     res.json({ ok: true, status: 'suspenso' });
   } catch (err) {
@@ -1337,7 +1355,7 @@ app.post('/api/v1/denuncias/:id/reativar', requireAdmin, async (req, res) => {
   try {
     const idNum = Number(req.body?.tecnicoId);
     if (Number.isInteger(idNum)) {
-      Tecnicos.atualizarStatus(idNum, 'ativo', req.body?.adminNome || 'admin');
+      await Tecnicos.atualizarStatus(idNum, 'ativo', req.body?.adminNome || 'admin');
     }
     res.json({ ok: true, status: 'ativo' });
   } catch (err) {
@@ -1374,21 +1392,21 @@ app.post('/api/v1/tecnicos/:id/avaliacoes', limiterAval, async (req, res) => {
   try {
     // Confirma que o técnico existe antes de criar qualquer registro —
     // evita acumular avaliações "fantasma" para IDs inventados.
-    const tecnico = Tecnicos.buscarPorId(idNum);
+    const tecnico = await Tecnicos.buscarPorId(idNum);
     if (!tecnico) return res.status(404).json({ erro: 'Técnico não encontrado.' });
 
     const ip = req.ip || req.socket?.remoteAddress || 'desconhecido';
-    if (Avaliacoes.jaAvaliouHoje(idNum, ip)) {
+    if (await Avaliacoes.jaAvaliouHoje(idNum, ip)) {
       return res.status(429).json({ erro: 'Você já avaliou este técnico hoje.' });
     }
 
     const autorLimpo = autor.trim().slice(0, 80);
     const textoLimpo = texto.trim().slice(0, 400);
 
-    Avaliacoes.criar({ tecnicoId: idNum, autorNome: autorLimpo, texto: textoLimpo, nota, ip });
-    Tecnicos.atualizarMediaAvaliacoes(idNum);
+    await Avaliacoes.criar({ tecnicoId: idNum, autorNome: autorLimpo, texto: textoLimpo, nota, ip });
+    await Tecnicos.atualizarMediaAvaliacoes(idNum);
 
-    const avs = Avaliacoes.listarPorTecnico(idNum);
+    const avs = await Avaliacoes.listarPorTecnico(idNum);
 
     console.log(`[avaliação] ${nota}★ — técnico ${idNum} — ${autorLimpo}`);
     res.status(201).json({
@@ -1407,7 +1425,7 @@ app.post('/api/v1/tecnicos/:id/avaliacoes', limiterAval, async (req, res) => {
 app.get('/api/v1/tecnicos/:id/avaliacoes', async (req, res) => {
   try {
     const idNum = Number(req.params.id);
-    const avs   = Number.isInteger(idNum) ? Avaliacoes.listarPorTecnico(idNum) : [];
+    const avs   = Number.isInteger(idNum) ? await Avaliacoes.listarPorTecnico(idNum) : [];
     const avaliacoesPublicas = avs.map(a => ({
       autor: a.autor_nome, texto: a.texto, stars: a.nota, data: a.criado_em,
     }));
@@ -1427,10 +1445,10 @@ function rotaContador(campo, label) {
   return async (req, res) => {
     try {
       const idNum = Number(req.params.id);
-      if (!Number.isInteger(idNum) || !Tecnicos.buscarPorId(idNum)) {
+      if (!Number.isInteger(idNum) || !await Tecnicos.buscarPorId(idNum)) {
         return res.status(404).json({ erro: 'Técnico não encontrado.' });
       }
-      Tecnicos.incrementarContador(idNum, campo);
+      await Tecnicos.incrementarContador(idNum, campo);
       res.json({ sucesso: true });
     } catch (err) {
       console.error(`[${label}] Erro:`, err?.message || err);
@@ -1474,7 +1492,7 @@ app.post('/api/v1/demandas', async (req, res) => {
       canal: canal || 'wpp',
     });
 
-    const info = Demandas.criar({
+    const info = await Demandas.criar({
       produtorNome: (produtor || 'Produtor').trim().slice(0, 60),
       cultura:      sanD(cultura, 60),
       descricao:    sanD(descricao, 400),
@@ -1500,7 +1518,7 @@ app.get('/api/v1/demandas', async (req, res) => {
     // Demandas.listarAtivas() já faz um SELECT explícito sem contato_enc/
     // contato_iv/ip_hash — nunca expõe dados de contato publicamente,
     // por design da query (allow-list), não por filtragem depois.
-    const publicas = Demandas.listarAtivas();
+    const publicas = await Demandas.listarAtivas();
     res.json({ total: publicas.length, demandas: publicas });
   } catch (err) {
     res.status(500).json({ erro: 'Erro ao listar demandas.' });
@@ -1514,19 +1532,19 @@ app.post('/api/v1/demandas/:id/desbloquear', async (req, res) => {
 
   try {
     const idNum = Number(tecnicoId);
-    const tecnico = Number.isInteger(idNum) ? Tecnicos.buscarPorId(idNum) : null;
+    const tecnico = Number.isInteger(idNum) ? await Tecnicos.buscarPorId(idNum) : null;
     if (!tecnico?.premium) return res.status(403).json({ erro: 'Acesso restrito ao Plano Premium.', upgrade: true });
 
     // Prova de posse — sem isso, qualquer um que soubesse um tecnicoId
     // premium real desbloquearia qualquer demanda. O token só é conhecido
     // por quem consultou o status daquele pagamento já aprovado.
-    const tokenValido = Pagamentos.desbloqueioTokenPorTecnico(idNum);
+    const tokenValido = await Pagamentos.desbloqueioTokenPorTecnico(idNum);
     if (!tokenValido || desbloqueioToken !== tokenValido) {
       return res.status(403).json({ erro: 'Token de acesso inválido.' });
     }
 
     const demandaId = Number(req.params.id);
-    const registro  = Number.isInteger(demandaId) ? Demandas.buscarContato(demandaId) : null;
+    const registro  = Number.isInteger(demandaId) ? await Demandas.buscarContato(demandaId) : null;
     if (!registro) return res.status(404).json({ erro: 'Demanda não encontrada.' });
 
     // Só decifra depois de confirmado o pagamento — se o payload foi
@@ -1534,7 +1552,7 @@ app.post('/api/v1/demandas/:id/desbloquear', async (req, res) => {
     // erro em vez de devolver contato incorreto silenciosamente.
     const contato = cripto.decifrarContato(registro.contato_enc, registro.contato_iv);
 
-    Demandas.registrarDesbloqueio(demandaId, idNum, req.ip || '');
+    await Demandas.registrarDesbloqueio(demandaId, idNum, req.ip || '');
 
     console.log(`[demanda] Contato desbloqueado: ${demandaId} por técnico ${idNum}`);
     res.json({ wpp: contato.wpp, email: contato.email, canal: contato.canal });
@@ -1548,7 +1566,7 @@ app.delete('/api/v1/demandas/:id', requireAdmin, async (req, res) => {
   try {
     const idNum = Number(req.params.id);
     if (!Number.isInteger(idNum)) return res.status(404).json({ erro: 'Demanda não encontrada.' });
-    Demandas.encerrar(idNum);
+    await Demandas.encerrar(idNum);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ erro: 'Erro ao encerrar demanda.' });
@@ -1678,7 +1696,7 @@ app.get('/api/v1/tecnicos', async (req, res) => {
     const { cidade, raio, uf } = req.query;
     const raioKm = parseInt(raio);
 
-    let tecnicos = Tecnicos.listar({ uf: uf || undefined })
+    let tecnicos = (await Tecnicos.listar({ uf: uf || undefined }))
       .map(sanitizarTecnicoPublico);
 
     if (cidade && !isNaN(raioKm)) {
@@ -1713,7 +1731,7 @@ app.get('/api/v1/tecnicos', async (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 app.get('/api/v1/tecnicos/public/:publicId', async (req, res) => {
   try {
-    const tecnico = Tecnicos.buscarPorPublicId(req.params.publicId);
+    const tecnico = await Tecnicos.buscarPorPublicId(req.params.publicId);
 
     if (!tecnico || !tecnico.ativo || tecnico.status !== 'ativo') {
       return res.status(404).json({ erro: 'Técnico não encontrado.' });
@@ -1738,7 +1756,7 @@ app.get('/api/v1/tecnicos/public/:publicId', async (req, res) => {
 
 app.get('/api/v1/aviso', async (req, res) => {
   try {
-    const a = Avisos.ativo();
+    const a = await Avisos.ativo();
     res.json({ texto: a?.texto || '', ativo: !!a?.texto });
   } catch {
     res.json({ texto: '', ativo: false });
@@ -1748,13 +1766,13 @@ app.get('/api/v1/aviso', async (req, res) => {
 app.post('/api/v1/aviso', requireAdmin, async (req, res) => {
   const { texto } = req.body;
   if (!texto?.trim()) return res.status(400).json({ erro: 'Texto obrigatório.' });
-  Avisos.publicar(texto.trim());
+  await Avisos.publicar(texto.trim());
   console.log(`[aviso] Publicado: "${texto.trim().slice(0, 60)}"`);
   res.json({ ok: true, texto: texto.trim() });
 });
 
 app.delete('/api/v1/aviso', requireAdmin, async (req, res) => {
-  Avisos.remover();
+  await Avisos.remover();
   console.log('[aviso] Removido.');
   res.json({ ok: true });
 });
@@ -1799,7 +1817,7 @@ app.get('/api/v1/classificados/contagem/:identificador', async (req, res) => {
     if (!ident || ident.length < 5) {
       return res.status(400).json({ erro: 'Identificador inválido.' });
     }
-    const total = Classificados.contarPorIdent(ident);
+    const total = await Classificados.contarPorIdent(ident);
     res.json({ identificador: ident, total, primeiroBloqueado: total >= 1 });
   } catch (err) {
     console.error('[classificados/contagem] Erro:', err?.message);
@@ -1814,7 +1832,7 @@ app.get('/api/v1/classificados/contagem/:identificador', async (req, res) => {
  */
 app.get('/api/v1/classificados', async (req, res) => {
   try {
-    const ativos = Classificados.listarAtivos();
+    const ativos = await Classificados.listarAtivos();
     res.json({ total: ativos.length, classificados: ativos });
   } catch (err) {
     console.error('[classificados] Erro:', err?.message);
@@ -1847,7 +1865,7 @@ app.post('/api/v1/classificados/publicar', limiterCad, async (req, res) => {
   const identificador = wppLimpo; // canônico = WhatsApp limpo (sem espaços/máscaras)
 
   try {
-    const total = Classificados.contarPorIdent(identificador);
+    const total = await Classificados.contarPorIdent(identificador);
 
     if (total >= 1) {
       // Já usou o grátis — frontend deve gerar Pix antes de publicar
@@ -1860,7 +1878,7 @@ app.post('/api/v1/classificados/publicar', limiterCad, async (req, res) => {
     }
 
     // Primeiro anúncio — publica gratuitamente
-    const info = Classificados.criar({
+    const info = await Classificados.criar({
       identificador,
       empresa: san(empresa, 60),
       titulo:  san(titulo, 80),
@@ -1902,7 +1920,7 @@ app.post('/api/v1/classificados/confirmar/:pagamentoId', async (req, res) => {
 
   try {
     // Idempotência — verifica se este pagamento já publicou um anúncio
-    const jaPublicado = Classificados.buscarPorPagamentoId(pagamentoId);
+    const jaPublicado = await Classificados.buscarPorPagamentoId(pagamentoId);
     if (jaPublicado) {
       _confirmarLiberarLock(pagamentoId);
       return res.json({ ok: true, duplicata: true, id: jaPublicado.id });
@@ -1920,7 +1938,7 @@ app.post('/api/v1/classificados/confirmar/:pagamentoId', async (req, res) => {
     const san = (v, max) => (v || '').trim().replace(/[<>"'`]/g, '').slice(0, max);
     const identificador = wppLimpo;
 
-    const info = Classificados.criar({
+    const info = await Classificados.criar({
       identificador,
       empresa: san(empresa, 60),
       titulo:  san(titulo, 80),
@@ -1954,7 +1972,7 @@ app.post('/api/v1/classificados/registrar', requireAdmin, async (req, res) => {
   try {
     const { identificador } = req.body;
     if (!identificador) return res.status(400).json({ erro: 'Identificador obrigatório.' });
-    const total = Classificados.contarPorIdent(identificador);
+    const total = await Classificados.contarPorIdent(identificador);
     res.json({ ok: true, total, aviso: 'Contagem derivada automaticamente das linhas de classificados — nada foi incrementado manualmente.' });
   } catch (err) {
     res.status(500).json({ erro: 'Erro ao consultar contagem.' });
@@ -1982,7 +2000,7 @@ app.post('/api/admin/login', limiterLogin, async (req, res) => {
     return res.status(401).json({ erro: 'Credenciais inválidas.' });
   }
 
-  const token    = AdminSessoes.criar(req.ip || '', ADMIN_SESS_TTL);
+  const token    = await AdminSessoes.criar(req.ip || '', ADMIN_SESS_TTL);
   const expiraEm = Date.now() + ADMIN_SESS_TTL;
 
   // Cookie HttpOnly — não acessível via JavaScript
@@ -1999,17 +2017,17 @@ app.post('/api/admin/login', limiterLogin, async (req, res) => {
 });
 
 // POST /api/admin/logout
-app.post('/api/admin/logout', (req, res) => {
+app.post('/api/admin/logout', async (req, res) => {
   const token = req.cookies?.agro_admin_sess;
-  if (token) AdminSessoes.revogar(token);
+  if (token) await AdminSessoes.revogar(token);
   res.clearCookie('agro_admin_sess', { path: '/' });
   res.json({ ok: true });
 });
 
 // GET /api/admin/verificar — frontend checa se sessão ainda é válida ao recarregar
-app.get('/api/admin/verificar', (req, res) => {
+app.get('/api/admin/verificar', async (req, res) => {
   const token = req.cookies?.agro_admin_sess;
-  res.json({ logado: !!(token && AdminSessoes.validar(token)) });
+  res.json({ logado: !!(token && await AdminSessoes.validar(token)) });
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -2091,7 +2109,7 @@ app.get('/api/admin/crescimento', requireAdmin, async (req, res) => {
     try { produtores = JSON.parse(await fs.readFile(path.join(__dirname, 'pedidos.json'),  'utf-8')); } catch { /* ok */ }
 
     // Pagamentos aprovados por mês — migrado para Pagamentos.aprovadosPorMes() (db.js)
-    const aprovadosPorMes = Pagamentos.aprovadosPorMes(6);
+    const aprovadosPorMes = await Pagamentos.aprovadosPorMes(6);
     const mapaAprovados = Object.fromEntries(aprovadosPorMes.map(r => [r.mes, r.total]));
 
     // Agrupa cadastros de técnicos por mês (últimos 6 meses)
@@ -2122,7 +2140,7 @@ app.get('/api/admin/crescimento', requireAdmin, async (req, res) => {
       resumo: {
         total_tecnicos:  Object.keys(tecnicos).length,
         ativos:          Object.values(tecnicos).filter(t => t.status === 'ativo').length,
-        premium_ativo:   Pagamentos.totalAprovados(),
+        premium_ativo:   await Pagamentos.totalAprovados(),
         total_pedidos:   produtores.length,
       },
     });
@@ -2224,7 +2242,7 @@ function cidadeParaSlug(nome) {
  */
 async function sitemapLerTecnicos() {
   try {
-    return Tecnicos.listar({})
+    return (await Tecnicos.listar({}))
       .map(t => {
         let esps = [];
         try { esps = JSON.parse(t.especialidades || '[]'); } catch { esps = []; }
@@ -2530,7 +2548,7 @@ app.get('/tecnicos/:uf', async (req, res) => {
 
   // 2. Ler técnicos reais — Tecnicos.listar({ uf }) já filtra
   // ativo=1 AND status='ativo' AND uf=? na própria query SQL.
-  const tecnicos = Tecnicos.listar({ uf });
+  const tecnicos = await Tecnicos.listar({ uf });
 
   // 3. Sem técnicos ativos nessa UF → 404
   if (tecnicos.length === 0) {
@@ -2593,7 +2611,7 @@ ${itens}
  */
 app.get('/api/v1/tecnico/me', requireTecnico, async (req, res) => {
   try {
-    const tecnico = Tecnicos.buscarPorId(req.tecnicoSessao.tecnicoId);
+    const tecnico = await Tecnicos.buscarPorId(req.tecnicoSessao.tecnicoId);
     if (!tecnico) return res.status(404).json({ erro: 'Técnico não encontrado.' });
 
     let especialidades = [];
@@ -2642,7 +2660,7 @@ app.get('/api/v1/tecnico/me', requireTecnico, async (req, res) => {
  */
 app.get('/api/v1/tecnico/dashboard', requireTecnico, async (req, res) => {
   try {
-    const tecnico = Tecnicos.buscarPorId(req.tecnicoSessao.tecnicoId);
+    const tecnico = await Tecnicos.buscarPorId(req.tecnicoSessao.tecnicoId);
     if (!tecnico) return res.status(404).json({ erro: 'Técnico não encontrado.' });
 
     res.json({
@@ -2672,7 +2690,7 @@ app.get('/api/v1/tecnico/dashboard', requireTecnico, async (req, res) => {
  */
 app.get('/api/v1/tecnico/premium', requireTecnico, async (req, res) => {
   try {
-    const tecnico = Tecnicos.buscarPorId(req.tecnicoSessao.tecnicoId);
+    const tecnico = await Tecnicos.buscarPorId(req.tecnicoSessao.tecnicoId);
     if (!tecnico) return res.status(404).json({ erro: 'Tecnico nao encontrado.' });
 
     const premiumDesde = tecnico.premium_desde || null;
@@ -2711,7 +2729,7 @@ app.get('/api/v1/tecnico/premium', requireTecnico, async (req, res) => {
  */
 app.get('/api/v1/tecnico/oportunidades', requireTecnico, async (req, res) => {
   try {
-    const tecnico = Tecnicos.buscarPorId(req.tecnicoSessao.tecnicoId);
+    const tecnico = await Tecnicos.buscarPorId(req.tecnicoSessao.tecnicoId);
 
     let especialidadesTec = [];
     try { especialidadesTec = JSON.parse(tecnico?.especialidades || '[]'); } catch { /* ok */ }
@@ -2735,7 +2753,7 @@ app.get('/api/v1/tecnico/oportunidades', requireTecnico, async (req, res) => {
 
     // Demandas.listarAtivas() já retorna sem wpp/email/ip (SELECT
     // explícito) e ordenada por criado_em DESC.
-    const ativas = Demandas.listarAtivas();
+    const ativas = await Demandas.listarAtivas();
 
     // Se não houver especialidades cadastradas, comportamento original
     const semEspecialidades = termosEsp.length === 0 && !ufTecnico;
@@ -2764,7 +2782,7 @@ app.get('/api/v1/tecnico/oportunidades', requireTecnico, async (req, res) => {
  */
 app.get('/api/v1/tecnico/avaliacoes', requireTecnico, async (req, res) => {
   try {
-    const avsDb = Avaliacoes.listarPorTecnico(req.tecnicoSessao.tecnicoId);
+    const avsDb = await Avaliacoes.listarPorTecnico(req.tecnicoSessao.tecnicoId);
     const avaliacoes = avsDb.map(a => ({ id: a.id, autor: a.autor_nome, texto: a.texto, stars: a.nota, data: a.criado_em }));
     const media = avsDb.length ? calcularMedia(avsDb) : null;
 
@@ -2782,7 +2800,7 @@ app.get('/api/v1/tecnico/avaliacoes', requireTecnico, async (req, res) => {
  */
 app.get('/api/v1/tecnico/estatisticas', requireTecnico, async (req, res) => {
   try {
-    const tecnico = Tecnicos.buscarPorId(req.tecnicoSessao.tecnicoId);
+    const tecnico = await Tecnicos.buscarPorId(req.tecnicoSessao.tecnicoId);
     if (!tecnico) return res.status(404).json({ erro: 'Tecnico nao encontrado.' });
 
     res.json({
@@ -2826,10 +2844,10 @@ app.put('/api/v1/tecnico/me/perfil', requireTecnico, async (req, res) => {
 
   try {
     const idNum = req.tecnicoSessao.tecnicoId;
-    if (!Tecnicos.buscarPorId(idNum)) return res.status(404).json({ erro: 'Tecnico nao encontrado.' });
+    if (!await Tecnicos.buscarPorId(idNum)) return res.status(404).json({ erro: 'Tecnico nao encontrado.' });
 
-    Tecnicos.atualizarPerfil(idNum, { bio: bioLimpa, formacao: formacaoLimpa, experiencia: experienciaLimpa });
-    const tecnico = Tecnicos.buscarPorId(idNum);
+    await Tecnicos.atualizarPerfil(idNum, { bio: bioLimpa, formacao: formacaoLimpa, experiencia: experienciaLimpa });
+    const tecnico = await Tecnicos.buscarPorId(idNum);
     console.log(`[tecnico/me/perfil] Perfil atualizado — tecnico ${idNum}`);
 
     res.json({
@@ -2868,9 +2886,9 @@ app.put('/api/v1/tecnico/me/especialidades', requireTecnico, async (req, res) =>
 
   try {
     const idNum = req.tecnicoSessao.tecnicoId;
-    if (!Tecnicos.buscarPorId(idNum)) return res.status(404).json({ erro: 'Tecnico nao encontrado.' });
+    if (!await Tecnicos.buscarPorId(idNum)) return res.status(404).json({ erro: 'Tecnico nao encontrado.' });
 
-    Tecnicos.atualizarEspecialidades(idNum, lista);
+    await Tecnicos.atualizarEspecialidades(idNum, lista);
     console.log(`[tecnico/me/especialidades] Atualizado — tecnico ${idNum} — ${lista.length} item(s)`);
 
     res.json({
@@ -2908,9 +2926,9 @@ app.put('/api/v1/tecnico/me/servicos', requireTecnico, async (req, res) => {
 
   try {
     const idNum = req.tecnicoSessao.tecnicoId;
-    if (!Tecnicos.buscarPorId(idNum)) return res.status(404).json({ erro: 'Tecnico nao encontrado.' });
+    if (!await Tecnicos.buscarPorId(idNum)) return res.status(404).json({ erro: 'Tecnico nao encontrado.' });
 
-    Tecnicos.atualizarServicos(idNum, lista);
+    await Tecnicos.atualizarServicos(idNum, lista);
     console.log(`[tecnico/me/servicos] Atualizado — tecnico ${idNum} — ${lista.length} item(s)`);
 
     res.json({
@@ -2953,10 +2971,10 @@ app.put('/api/v1/tecnico/me/contato', requireTecnico, async (req, res) => {
 
   try {
     const idNum = req.tecnicoSessao.tecnicoId;
-    if (!Tecnicos.buscarPorId(idNum)) return res.status(404).json({ erro: 'Técnico não encontrado.' });
+    if (!await Tecnicos.buscarPorId(idNum)) return res.status(404).json({ erro: 'Técnico não encontrado.' });
 
-    Tecnicos.atualizarContato(idNum, { whatsapp: wppLimpo, email: emailLimpo });
-    const tecnico = Tecnicos.buscarPorId(idNum);
+    await Tecnicos.atualizarContato(idNum, { whatsapp: wppLimpo, email: emailLimpo });
+    const tecnico = await Tecnicos.buscarPorId(idNum);
     console.log(`[tecnico/me/contato] Contato atualizado — técnico ${idNum}`);
 
     res.json({
@@ -2995,13 +3013,13 @@ app.post('/api/v1/tecnico/senha', limiterLogin, async (req, res) => {
 
   try {
     const idNum = Number(tecnicoId);
-    const tecnico = Number.isInteger(idNum) ? Tecnicos.buscarPorId(idNum) : null;
+    const tecnico = Number.isInteger(idNum) ? await Tecnicos.buscarPorId(idNum) : null;
     if (!tecnico) return res.status(404).json({ erro: 'Técnico não encontrado.' });
 
     // Prova de posse — uploadToken gerado no cadastro, conhecido apenas pelo técnico.
     // Checado ANTES da tentativa de gravação para não vazar, pela resposta 409,
     // se uma senha já existe a quem não provou posse do cadastro.
-    if (!Tecnicos.verificarUploadToken(idNum, uploadToken)) {
+    if (!await Tecnicos.verificarUploadToken(idNum, uploadToken)) {
       return res.status(403).json({ erro: 'Token inválido.' });
     }
 
@@ -3011,7 +3029,7 @@ app.post('/api/v1/tecnico/senha', limiterLogin, async (req, res) => {
       .update(senha)
       .digest('hex');
 
-    const resultado = Tecnicos.definirSenhaPrimeiroAcesso(idNum, senhaHash);
+    const resultado = await Tecnicos.definirSenhaPrimeiroAcesso(idNum, senhaHash);
     if (!resultado.ok) {
       // Bloqueia se senha já foi definida — uploadToken só vale para o primeiro
       // acesso. Alterações posteriores devem ser feitas via sessão autenticada.
@@ -3019,7 +3037,7 @@ app.post('/api/v1/tecnico/senha', limiterLogin, async (req, res) => {
     }
 
     // Invalida todas as sessões ativas do técnico — novo login obrigatório
-    TecnicoSessoes.revogarTodasDoTecnico(idNum);
+    await TecnicoSessoes.revogarTodasDoTecnico(idNum);
     console.log(`[tecnico/senha] Primeiro acesso — senha definida para técnico ${tecnicoId}`);
 
     res.json({ ok: true, mensagem: 'Senha criada com sucesso. Use /api/v1/tecnico/login para entrar.' });
@@ -3047,7 +3065,7 @@ app.post('/api/v1/tecnico/login', limiterLogin, async (req, res) => {
   }
 
   try {
-    const tecnico = Tecnicos.buscarPorIdentificador(identificador);
+    const tecnico = await Tecnicos.buscarPorIdentificador(identificador);
 
     if (!tecnico || !tecnico.senha_hash) {
       // Delay anti-brute-force — mesmo padrão do admin
@@ -3065,7 +3083,7 @@ app.post('/api/v1/tecnico/login', limiterLogin, async (req, res) => {
       return res.status(401).json({ erro: 'Credenciais inválidas.' });
     }
 
-    const { token, expiraEm } = TecnicoSessoes.criar(tecnico.id, req.ip || '');
+    const { token, expiraEm } = await TecnicoSessoes.criar(tecnico.id, req.ip || '');
 
     // Cookie HttpOnly — não acessível via JavaScript
     res.cookie('agro_tec_sess', token, {
@@ -3092,18 +3110,31 @@ app.post('/api/v1/tecnico/login', limiterLogin, async (req, res) => {
 });
 
 // POST /api/v1/tecnico/logout
-app.post('/api/v1/tecnico/logout', (req, res) => {
+app.post('/api/v1/tecnico/logout', async (req, res) => {
   const token = req.cookies?.agro_tec_sess;
-  if (token) TecnicoSessoes.revogar(token);
+  if (token) await TecnicoSessoes.revogar(token);
   res.clearCookie('agro_tec_sess', { path: '/' });
   res.json({ ok: true });
 });
 
 // GET /api/v1/tecnico/verificar — frontend checa se sessão ainda é válida ao recarregar
-app.get('/api/v1/tecnico/verificar', (req, res) => {
+app.get('/api/v1/tecnico/verificar', async (req, res) => {
   const token  = req.cookies?.agro_tec_sess;
-  const sessao = token ? TecnicoSessoes.validar(token) : null;
+  const sessao = token ? await TecnicoSessoes.validar(token) : null;
   res.json({ logado: !!sessao, tecnicoId: sessao ? sessao.tecnicoId : null });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// SITE ESTÁTICO — necessário no Render (processo único, sem Nginx
+// separado servindo o HTML como no plano VPS). O server.js é uma API
+// pura; esta é a única rota que entrega o front-end de fato.
+// No VPS (nginx-agrotecnico.conf), o Nginx serve o HTML diretamente
+// do disco e nem chega a repassar essa rota pro Node — as duas
+// arquiteturas convivem sem conflito, cada uma servindo o mesmo
+// arquivo do jeito apropriado à sua infraestrutura.
+// ══════════════════════════════════════════════════════════════════
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'agrotecnico-final.html'));
 });
 
 // ── 404 ────────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@
  * ║  AgroTécnico — Camada de Banco de Dados                         ║
  * ║                                                                  ║
  * ║  MVP:       SQLite via better-sqlite3 (zero infraestrutura)     ║
- * ║  Produção:  Troque o driver abaixo por 'pg' (PostgreSQL)        ║
+ * ║  Produção:  PostgreSQL via 'pg' — ativado com DATABASE_URL      ║
  * ║                                                                  ║
  * ║  INSTALAÇÃO MVP:                                                 ║
  * ║    npm install better-sqlite3                                    ║
@@ -12,6 +12,19 @@
  * ║    npm install pg                                                ║
  * ║    # Definir DATABASE_URL no .env                               ║
  * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * ── POR QUE TODO REPOSITÓRIO AQUI É async/await ─────────────────────
+ * O driver SQLite (better-sqlite3) é SÍNCRONO — query/queryOne/run
+ * retornam o valor direto, na hora. O driver Postgres (pg) é
+ * ASSÍNCRONO — os mesmos métodos retornam Promises, porque falam com
+ * um banco pela rede. `await` funciona corretamente nos dois casos
+ * (await em um valor não-Promise apenas resolve na hora), então TODO
+ * método de repositório aqui usa async/await, mesmo os que rodam
+ * contra SQLite — é o único jeito de ter uma interface realmente
+ * idêntica entre os dois bancos, sem armadilha de Promise não
+ * aguardada (bug real encontrado e corrigido nesta revisão: métodos
+ * sem await retornavam a própria Promise em vez do dado, fazendo
+ * checagens como `if (!tecnico)` nunca disparar 404 contra Postgres).
  */
 
 'use strict';
@@ -79,9 +92,12 @@ function criarDriverSQLite() {
       return db.transaction(fn)(this);
     },
 
-    // Compatibilidade de sintaxe com PostgreSQL: ? → $1, $2...
-    // SQLite usa ? nativamente — sem conversão necessária.
-    placeholder: (n) => '?',
+    // ── Helpers de dialeto SQL — SQLite ──────────────────────────
+    // Repositórios chamam essas funções em vez de escrever
+    // `datetime('now')` direto no texto da query, para que o mesmo
+    // código de repositório funcione sem alteração nos dois bancos.
+    agora:        () => "datetime('now')",
+    condicaoHoje: (coluna) => `date(${coluna}) = date('now')`,
 
     close() { db.close(); },
   };
@@ -90,6 +106,48 @@ function criarDriverSQLite() {
 // ══════════════════════════════════════════════════════════════════
 // DRIVER PostgreSQL (Produção)
 // ══════════════════════════════════════════════════════════════════
+
+/**
+ * Traduz placeholders `?` (sintaxe SQLite) para `$1, $2, ...`
+ * (sintaxe Postgres/pg), na ordem em que aparecem. Todo repositório
+ * escreve as queries com `?` — essa tradução acontece uma vez, aqui,
+ * em vez de reescrever ~70 strings SQL manualmente.
+ */
+function traduzirPlaceholders(sql) {
+  let n = 0;
+  return sql.replace(/\?/g, () => `$${++n}`);
+}
+
+/**
+ * Executa schema-postgres.sql statement por statement (não confia no
+ * protocolo simples do 'pg' aceitar múltiplos comandos em uma única
+ * chamada — testado e confirmado que o divisor manual é mais seguro
+ * e dá erros mais claros, apontando exatamente qual statement falhou).
+ */
+async function executarSchemaPostgres(pool) {
+  const schemaPath = path.join(__dirname, 'schema-postgres.sql');
+  const schemaSql  = fs.readFileSync(schemaPath, 'utf-8');
+
+  // Remove comentários de linha antes de dividir por ';', para um ';'
+  // dentro de um comentário não cortar um statement no lugar errado.
+  const semComentarios = schemaSql
+    .split('\n')
+    .map(linha => {
+      const idx = linha.indexOf('--');
+      return idx === -1 ? linha : linha.slice(0, idx);
+    })
+    .join('\n');
+
+  const statements = semComentarios
+    .split(';')
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
+  for (const stmt of statements) {
+    await pool.query(stmt);
+  }
+}
+
 function criarDriverPostgres() {
   const { Pool } = require('pg');
   const pool = new Pool({
@@ -104,32 +162,56 @@ function criarDriverPostgres() {
     console.error('[db] PostgreSQL pool error:', err.message);
   });
 
-  console.log('[db] PostgreSQL conectado via pool');
+  // Promise de "schema pronto" — toda chamada real de query/queryOne/run
+  // espera essa promise antes de executar, garantindo que as tabelas já
+  // existem mesmo que a primeira requisição chegue antes do schema
+  // terminar de rodar. Módulo carrega de forma síncrona (CommonJS não
+  // tem top-level await), então essa é a forma correta de sequenciar
+  // um passo assíncrono obrigatório antes do primeiro uso real.
+  const schemaPronto = executarSchemaPostgres(pool)
+    .then(() => console.log('[db] Schema PostgreSQL (schema-postgres.sql) executado com sucesso.'))
+    .catch(err => {
+      console.error('[db] ERRO FATAL ao executar schema-postgres.sql:', err.message);
+      throw err;
+    });
+
+  console.log('[db] PostgreSQL conectado via pool — aguardando schema...');
 
   return {
     async query(sql, params = []) {
-      const res = await pool.query(sql, params);
+      await schemaPronto;
+      const res = await pool.query(traduzirPlaceholders(sql), params);
       return res.rows;
     },
 
     async queryOne(sql, params = []) {
-      const res = await pool.query(sql, params);
+      await schemaPronto;
+      const res = await pool.query(traduzirPlaceholders(sql), params);
       return res.rows[0] || undefined;
     },
 
     async run(sql, params = []) {
-      const res = await pool.query(sql, params);
+      await schemaPronto;
+      const res = await pool.query(traduzirPlaceholders(sql), params);
+      // rows[0]?.id só existe se a query tiver RETURNING id — presente
+      // em todo INSERT cujo id gerado é usado depois pelo chamador.
       return { changes: res.rowCount, lastInsertRowid: res.rows[0]?.id };
     },
 
     async transaction(fn) {
+      await schemaPronto;
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
         const result = await fn({
-          query:    (sql, p) => client.query(sql, p).then(r => r.rows),
-          queryOne: (sql, p) => client.query(sql, p).then(r => r.rows[0]),
-          run:      (sql, p) => client.query(sql, p).then(r => ({ changes: r.rowCount })),
+          query:    async (sql, p) => (await client.query(traduzirPlaceholders(sql), p)).rows,
+          queryOne: async (sql, p) => (await client.query(traduzirPlaceholders(sql), p)).rows[0],
+          run:      async (sql, p) => {
+            const r = await client.query(traduzirPlaceholders(sql), p);
+            return { changes: r.rowCount, lastInsertRowid: r.rows[0]?.id };
+          },
+          agora:        () => 'NOW()',
+          condicaoHoje: (coluna) => `${coluna}::date = CURRENT_DATE`,
         });
         await client.query('COMMIT');
         return result;
@@ -141,8 +223,9 @@ function criarDriverPostgres() {
       }
     },
 
-    // PostgreSQL usa $1, $2... em vez de ?
-    placeholder: (n) => `$${n}`,
+    // ── Helpers de dialeto SQL — Postgres ────────────────────────
+    agora:        () => 'NOW()',
+    condicaoHoje: (coluna) => `${coluna}::date = CURRENT_DATE`,
 
     async close() { await pool.end(); },
   };
@@ -182,43 +265,43 @@ function slugNome(nome) {
 
 // ── REPOSITÓRIO: Produtores ───────────────────────────────────────
 const Produtores = {
-  buscarPorIdent(ident) {
+  async buscarPorIdent(ident) {
     return db.queryOne(
       'SELECT * FROM produtores WHERE identificador = ? AND ativo = 1',
       [ident.toLowerCase().trim()]
     );
   },
 
-  criar({ nome, identificador, tipoIdent, senhaHash, aceitouNovidades }) {
+  async criar({ nome, identificador, tipoIdent, senhaHash, aceitouNovidades }) {
     return db.run(
       `INSERT INTO produtores (nome, identificador, tipo_ident, senha_hash, aceita_novidades)
-       VALUES (?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?) RETURNING id`,
       [nome, identificador.toLowerCase().trim(), tipoIdent, senhaHash, aceitouNovidades ? 1 : 0]
     );
   },
 
-  contarFavoritos(produtorId) {
-    const r = db.queryOne('SELECT COUNT(*) as n FROM produtor_favoritos WHERE produtor_id = ?', [produtorId]);
-    return r?.n || 0;
+  async contarFavoritos(produtorId) {
+    const r = await db.queryOne('SELECT COUNT(*) as n FROM produtor_favoritos WHERE produtor_id = ?', [produtorId]);
+    return Number(r?.n || 0);
   },
 
-  toggleFavorito(produtorId, tecnicoId) {
-    const existe = db.queryOne(
+  async toggleFavorito(produtorId, tecnicoId) {
+    const existe = await db.queryOne(
       'SELECT 1 FROM produtor_favoritos WHERE produtor_id = ? AND tecnico_id = ?',
       [produtorId, tecnicoId]
     );
     if (existe) {
-      db.run('DELETE FROM produtor_favoritos WHERE produtor_id = ? AND tecnico_id = ?', [produtorId, tecnicoId]);
+      await db.run('DELETE FROM produtor_favoritos WHERE produtor_id = ? AND tecnico_id = ?', [produtorId, tecnicoId]);
       return false;
     }
-    db.run('INSERT INTO produtor_favoritos (produtor_id, tecnico_id) VALUES (?, ?)', [produtorId, tecnicoId]);
+    await db.run('INSERT INTO produtor_favoritos (produtor_id, tecnico_id) VALUES (?, ?)', [produtorId, tecnicoId]);
     return true;
   },
 };
 
 // ── REPOSITÓRIO: Técnicos ─────────────────────────────────────────
 const Tecnicos = {
-  listar({ uf, status = 'ativo', premium } = {}) {
+  async listar({ uf, status = 'ativo', premium } = {}) {
     let sql    = 'SELECT * FROM tecnicos WHERE status = ? AND ativo = 1';
     const params = [status];
     if (uf)      { sql += ' AND uf = ?';      params.push(uf.toUpperCase()); }
@@ -227,11 +310,11 @@ const Tecnicos = {
     return db.query(sql, params);
   },
 
-  buscarPorId(id) {
+  async buscarPorId(id) {
     return db.queryOne('SELECT * FROM tecnicos WHERE id = ?', [id]);
   },
 
-  buscarPorPublicId(publicId) {
+  async buscarPorPublicId(publicId) {
     return db.queryOne('SELECT * FROM tecnicos WHERE public_id = ?', [publicId]);
   },
 
@@ -239,7 +322,7 @@ const Tecnicos = {
    * Busca por e-mail OU whatsapp — usada no login do técnico, onde o
    * identificador pode ser digitado em qualquer um dos dois formatos.
    */
-  buscarPorIdentificador(identificador) {
+  async buscarPorIdentificador(identificador) {
     const identLimpo = (identificador || '').trim().toLowerCase();
     const wppLimpo    = (identificador || '').replace(/\D/g, '');
     return db.queryOne(
@@ -254,32 +337,33 @@ const Tecnicos = {
    * baseado em JSON, já que múltiplos processos podem escrever ao mesmo
    * tempo em produção.
    */
-  gerarPublicIdUnico(nome) {
+  async gerarPublicIdUnico(nome) {
     const base = `tc-${slugNome(nome) || 'tecnico'}`;
-    if (!db.queryOne('SELECT 1 FROM tecnicos WHERE public_id = ?', [base])) return base;
+    if (!(await db.queryOne('SELECT 1 FROM tecnicos WHERE public_id = ?', [base]))) return base;
     let n = 2;
     let candidato = `${base}-${n}`;
-    while (db.queryOne('SELECT 1 FROM tecnicos WHERE public_id = ?', [candidato])) {
+    while (await db.queryOne('SELECT 1 FROM tecnicos WHERE public_id = ?', [candidato])) {
       n++;
       candidato = `${base}-${n}`;
     }
     return candidato;
   },
 
-  criar(dados) {
+  async criar(dados) {
     const cpfHash      = hashSensivel(dados.cpf);
-    const publicId     = this.gerarPublicIdUnico(dados.nome);
+    const publicId     = await this.gerarPublicIdUnico(dados.nome);
     const uploadToken  = crypto.randomUUID();
     const registroCompleto = `${dados.conselho}-${dados.ufConselho} ${dados.numConselho}`;
 
-    const info = db.run(
+    const info = await db.run(
       `INSERT INTO tecnicos
          (public_id, nome, whatsapp, email, cpf_hash, upload_token,
           cidade, uf, lat, lng, formacao,
           conselho, num_conselho, uf_conselho, registro_completo,
           bio, especialidades, servico, raio_km,
           status, ativo)
-       VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?,?, 'pendente', 0)`,
+       VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?,?, 'pendente', 0)
+       RETURNING id`,
       [
         publicId, dados.nome, dados.whatsapp, dados.email || null, cpfHash, uploadToken,
         dados.cidade, dados.uf, dados.lat || null, dados.lng || null, dados.formacao || null,
@@ -297,36 +381,36 @@ const Tecnicos = {
    * definindo a 1ª senha) é quem de fato criou o cadastro — mesma
    * prova de posse usada no server.js original.
    */
-  verificarUploadToken(id, tokenRecebido) {
-    const tec = db.queryOne('SELECT upload_token FROM tecnicos WHERE id = ?', [id]);
+  async verificarUploadToken(id, tokenRecebido) {
+    const tec = await db.queryOne('SELECT upload_token FROM tecnicos WHERE id = ?', [id]);
     return !!(tec && tec.upload_token && tec.upload_token === tokenRecebido);
   },
 
-  salvarDocumento(id, { docPath, docOriginalName, docMime }) {
+  async salvarDocumento(id, { docPath, docOriginalName, docMime }) {
     return db.run(
       `UPDATE tecnicos SET doc_path = ?, doc_original_name = ?, doc_mime = ?,
-       doc_enviado_em = datetime('now'), atualizado_em = datetime('now')
+       doc_enviado_em = ${db.agora()}, atualizado_em = ${db.agora()}
        WHERE id = ?`,
       [docPath, docOriginalName, docMime, id]
     );
   },
 
-  listarPendentes() {
+  async listarPendentes() {
     return db.query("SELECT * FROM tecnicos WHERE status = 'pendente' ORDER BY criado_em DESC");
   },
 
-  atualizarStatus(id, status, adminNome = 'sistema') {
+  async atualizarStatus(id, status, adminNome = 'sistema') {
     return db.run(
-      `UPDATE tecnicos SET status = ?, ativo = ?, validado_em = datetime('now'), validado_por = ?,
-       atualizado_em = datetime('now') WHERE id = ?`,
+      `UPDATE tecnicos SET status = ?, ativo = ?, validado_em = ${db.agora()}, validado_por = ?,
+       atualizado_em = ${db.agora()} WHERE id = ?`,
       [status, status === 'ativo' ? 1 : 0, adminNome, id]
     );
   },
 
-  suspenderAutomaticamente(id) {
+  async suspenderAutomaticamente(id) {
     return db.run(
       `UPDATE tecnicos SET status = 'suspenso', ativo = 0, suspensao_auto = 1,
-       suspensao_data = datetime('now'), atualizado_em = datetime('now') WHERE id = ?`,
+       suspensao_data = ${db.agora()}, atualizado_em = ${db.agora()} WHERE id = ?`,
       [id]
     );
   },
@@ -336,18 +420,18 @@ const Tecnicos = {
    * Recusa se já existir senha — alterações posteriores exigem sessão
    * autenticada, não o upload_token do cadastro.
    */
-  definirSenhaPrimeiroAcesso(id, senhaHash) {
-    const tec = db.queryOne('SELECT senha_hash FROM tecnicos WHERE id = ?', [id]);
+  async definirSenhaPrimeiroAcesso(id, senhaHash) {
+    const tec = await db.queryOne('SELECT senha_hash FROM tecnicos WHERE id = ?', [id]);
     if (!tec) return { ok: false, motivo: 'nao_encontrado' };
     if (tec.senha_hash) return { ok: false, motivo: 'ja_definida' };
-    db.run('UPDATE tecnicos SET senha_hash = ? WHERE id = ?', [senhaHash, id]);
+    await db.run('UPDATE tecnicos SET senha_hash = ? WHERE id = ?', [senhaHash, id]);
     return { ok: true };
   },
 
-  ativarPremium(identificador, pagamentoId) {
+  async ativarPremium(identificador, pagamentoId) {
     return db.run(
-      `UPDATE tecnicos SET premium = 1, premium_desde = datetime('now'),
-       premium_pagamento_id = ?, atualizado_em = datetime('now')
+      `UPDATE tecnicos SET premium = 1, premium_desde = ${db.agora()},
+       premium_pagamento_id = ?, atualizado_em = ${db.agora()}
        WHERE whatsapp = ? OR email = ?`,
       [pagamentoId, identificador, identificador]
     );
@@ -359,21 +443,21 @@ const Tecnicos = {
    * (ex.: dois técnicos com o mesmo e-mail cadastrado por engano).
    * Preferir sempre este método quando o tecnicoId estiver disponível.
    */
-  ativarPremiumPorId(tecnicoId, pagamentoId) {
+  async ativarPremiumPorId(tecnicoId, pagamentoId) {
     return db.run(
-      `UPDATE tecnicos SET premium = 1, premium_desde = datetime('now'),
-       premium_pagamento_id = ?, atualizado_em = datetime('now')
+      `UPDATE tecnicos SET premium = 1, premium_desde = ${db.agora()},
+       premium_pagamento_id = ?, atualizado_em = ${db.agora()}
        WHERE id = ?`,
       [pagamentoId, tecnicoId]
     );
   },
 
-  atualizarMediaAvaliacoes(tecnicoId) {
-    const r = db.queryOne(
+  async atualizarMediaAvaliacoes(tecnicoId) {
+    const r = await db.queryOne(
       'SELECT AVG(nota) as media, COUNT(*) as total FROM avaliacoes WHERE tecnico_id = ?',
       [tecnicoId]
     );
-    db.run(
+    await db.run(
       'UPDATE tecnicos SET media_avaliacoes = ?, total_avaliacoes = ? WHERE id = ?',
       [r?.media || 0, r?.total || 0, tecnicoId]
     );
@@ -385,7 +469,7 @@ const Tecnicos = {
    * interpola o nome do parâmetro `campo` diretamente na query, para
    * não abrir brecha de SQL injection via nome de coluna arbitrário.
    */
-  incrementarContador(id, campo) {
+  async incrementarContador(id, campo) {
     const colunas = {
       visualizacoes:   'visualizacoes',
       cliquesWhatsapp: 'cliques_whatsapp',
@@ -396,73 +480,76 @@ const Tecnicos = {
     if (!coluna) throw new Error(`[Tecnicos.incrementarContador] campo inválido: ${campo}`);
     return db.run(`UPDATE tecnicos SET ${coluna} = ${coluna} + 1 WHERE id = ?`, [id]);
   },
+
   /**
    * Atualiza campos individuais do perfil — só grava o que foi passado,
    * preservando os demais (mesmo padrão "campos não enviados = mantidos"
    * das rotas PUT /tecnico/me/*).
    */
-  atualizarPerfil(id, { bio, formacao, experiencia } = {}) {
+  async atualizarPerfil(id, { bio, formacao, experiencia } = {}) {
     const campos = [];
     const valores = [];
     if (bio         !== undefined) { campos.push('bio = ?');         valores.push(bio); }
     if (formacao    !== undefined) { campos.push('formacao = ?');    valores.push(formacao); }
     if (experiencia !== undefined) { campos.push('experiencia = ?'); valores.push(experiencia); }
     if (!campos.length) return null;
-    campos.push("atualizado_em = datetime('now')");
+    campos.push(`atualizado_em = ${db.agora()}`);
     valores.push(id);
     return db.run(`UPDATE tecnicos SET ${campos.join(', ')} WHERE id = ?`, valores);
   },
 
-  atualizarEspecialidades(id, lista) {
+  async atualizarEspecialidades(id, lista) {
     return db.run(
-      `UPDATE tecnicos SET especialidades = ?, atualizado_em = datetime('now') WHERE id = ?`,
+      `UPDATE tecnicos SET especialidades = ?, atualizado_em = ${db.agora()} WHERE id = ?`,
       [JSON.stringify(lista), id]
     );
   },
 
-  atualizarServicos(id, lista) {
+  async atualizarServicos(id, lista) {
     return db.run(
-      `UPDATE tecnicos SET servicos = ?, atualizado_em = datetime('now') WHERE id = ?`,
+      `UPDATE tecnicos SET servicos = ?, atualizado_em = ${db.agora()} WHERE id = ?`,
       [JSON.stringify(lista), id]
     );
   },
 
-  atualizarContato(id, { whatsapp, email } = {}) {
+  async atualizarContato(id, { whatsapp, email } = {}) {
     const campos = [];
     const valores = [];
     if (whatsapp !== undefined) { campos.push('whatsapp = ?'); valores.push(whatsapp); }
     if (email    !== undefined) { campos.push('email = ?');    valores.push(email); }
     if (!campos.length) return null;
-    campos.push("atualizado_em = datetime('now')");
+    campos.push(`atualizado_em = ${db.agora()}`);
     valores.push(id);
     return db.run(`UPDATE tecnicos SET ${campos.join(', ')} WHERE id = ?`, valores);
   },
 };
+
+// ── REPOSITÓRIO: Sessões de Técnico ───────────────────────────────
 const TecnicoSessoes = {
-  criar(tecnicoId, ip) {
+  async criar(tecnicoId, ip) {
     const token    = crypto.randomUUID();
     const ipHash   = hashSensivel(ip);
     const expiraEm = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(); // 8 horas
-    db.run(
+    await db.run(
       'INSERT INTO tecnico_sessoes (token, tecnico_id, ip_hash, expira_em) VALUES (?,?,?,?)',
       [token, tecnicoId, ipHash, expiraEm]
     );
     return { token, expiraEm };
   },
 
-  validar(token) {
-    const r = db.queryOne(
-      "SELECT tecnico_id, expira_em FROM tecnico_sessoes WHERE token = ? AND expira_em > datetime('now')",
+  async validar(token) {
+    const r = await db.queryOne(
+      `SELECT tecnico_id, expira_em FROM tecnico_sessoes WHERE token = ? AND expira_em > ${db.agora()}`,
       [token]
     );
     return r ? { tecnicoId: r.tecnico_id } : null;
   },
 
-  revogar(token) {
+  async revogar(token) {
     return db.run('DELETE FROM tecnico_sessoes WHERE token = ?', [token]);
   },
 
-  revogarTodasDoTecnico(tecnicoId) {
+  async revogarTodasDoTecnico(tecnicoId) {
     return db.run('DELETE FROM tecnico_sessoes WHERE tecnico_id = ?', [tecnicoId]);
   },
 };
@@ -476,18 +563,26 @@ const Pagamentos = {
    * entrada DEPOIS da aprovação), permitindo status/histórico também
    * para pagamentos pendentes/rejeitados, e dá ao webhook uma linha
    * já existente para atualizar em vez de criar do zero.
+   *
+   * INSERT OR IGNORE é sintaxe SQLite — o equivalente Postgres é
+   * ON CONFLICT (...) DO NOTHING, com o alvo do conflito explícito
+   * (a coluna UNIQUE pagamento_id_mp). Os dois caminhos convivem aqui
+   * porque a sintaxe difere estruturalmente, não é só um placeholder.
    */
-  criarPendente({ pagamentoIdMp, identificador, tecnicoId, plano, valor, metodo = 'pix' }) {
-    return db.run(
-      `INSERT OR IGNORE INTO pagamentos
-         (pagamento_id_mp, identificador, tecnico_id, plano, valor, metodo, status)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
-      [pagamentoIdMp, identificador, tecnicoId || null, plano, valor, metodo]
-    );
+  async criarPendente({ pagamentoIdMp, identificador, tecnicoId, plano, valor, metodo = 'pix' }) {
+    const sql = USE_POSTGRES
+      ? `INSERT INTO pagamentos
+           (pagamento_id_mp, identificador, tecnico_id, plano, valor, metodo, status)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending')
+         ON CONFLICT (pagamento_id_mp) DO NOTHING`
+      : `INSERT OR IGNORE INTO pagamentos
+           (pagamento_id_mp, identificador, tecnico_id, plano, valor, metodo, status)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending')`;
+    return db.run(sql, [pagamentoIdMp, identificador, tecnicoId || null, plano, valor, metodo]);
   },
 
   // Mantido para compatibilidade — equivalente a criarPendente, nome antigo.
-  registrar({ pagamentoIdMp, identificador, plano, valor, metodo = 'pix' }) {
+  async registrar({ pagamentoIdMp, identificador, plano, valor, metodo = 'pix' }) {
     return this.criarPendente({ pagamentoIdMp, identificador, plano, valor, metodo });
   },
 
@@ -499,11 +594,11 @@ const Pagamentos = {
    *
    * @returns {{ desbloqueioToken: string }}
    */
-  aprovar(pagamentoIdMp, { tecnicoId } = {}) {
+  async aprovar(pagamentoIdMp, { tecnicoId } = {}) {
     let desbloqueioToken = null;
 
     if (tecnicoId) {
-      const anterior = db.queryOne(
+      const anterior = await db.queryOne(
         `SELECT desbloqueio_token FROM pagamentos
          WHERE tecnico_id = ? AND status = 'approved' AND desbloqueio_token IS NOT NULL
          ORDER BY aprovado_em DESC LIMIT 1`,
@@ -514,9 +609,9 @@ const Pagamentos = {
       desbloqueioToken = crypto.randomUUID();
     }
 
-    db.run(
-      `UPDATE pagamentos SET status = 'approved', aprovado_em = datetime('now'),
-       webhook_recebido_em = datetime('now'), idempotencia_ok = 1, desbloqueio_token = ?
+    await db.run(
+      `UPDATE pagamentos SET status = 'approved', aprovado_em = ${db.agora()},
+       webhook_recebido_em = ${db.agora()}, idempotencia_ok = 1, desbloqueio_token = ?
        WHERE pagamento_id_mp = ?`,
       [desbloqueioToken, pagamentoIdMp]
     );
@@ -524,15 +619,16 @@ const Pagamentos = {
     return { desbloqueioToken };
   },
 
-  jaAtivado(pagamentoIdMp) {
-    const r = db.queryOne(
+  async jaAtivado(pagamentoIdMp) {
+    const r = await db.queryOne(
       'SELECT idempotencia_ok FROM pagamentos WHERE pagamento_id_mp = ?',
       [pagamentoIdMp]
     );
-    return r?.idempotencia_ok === 1;
+    // Postgres devolve boolean nativo (true/false); SQLite devolve 0/1.
+    return r?.idempotencia_ok === 1 || r?.idempotencia_ok === true;
   },
 
-  buscarPorIdent(identificador) {
+  async buscarPorIdent(identificador) {
     return db.queryOne(
       `SELECT * FROM pagamentos WHERE identificador = ? AND status = 'approved'
        ORDER BY aprovado_em DESC LIMIT 1`,
@@ -540,12 +636,12 @@ const Pagamentos = {
     );
   },
 
-  buscarPorMpId(pagamentoIdMp) {
+  async buscarPorMpId(pagamentoIdMp) {
     return db.queryOne('SELECT * FROM pagamentos WHERE pagamento_id_mp = ?', [pagamentoIdMp]);
   },
 
   /** Usado por GET /pagamentos/status/id/:paymentId — polling seguro por ID. */
-  statusPorId(pagamentoIdMp) {
+  async statusPorId(pagamentoIdMp) {
     return db.queryOne(
       'SELECT status, aprovado_em, desbloqueio_token, tecnico_id FROM pagamentos WHERE pagamento_id_mp = ?',
       [pagamentoIdMp]
@@ -553,7 +649,7 @@ const Pagamentos = {
   },
 
   /** Usado por GET /pagamentos/status/:identificador — fallback legado. */
-  statusPorIdentificador(identificador) {
+  async statusPorIdentificador(identificador) {
     return db.queryOne(
       `SELECT status, aprovado_em FROM pagamentos
        WHERE identificador = ? AND status = 'approved'
@@ -567,8 +663,8 @@ const Pagamentos = {
    * desbloquear para provar que quem está pedindo o contato realmente
    * pagou (e não apenas descobriu o tecnicoId de outra pessoa).
    */
-  desbloqueioTokenPorTecnico(tecnicoId) {
-    const r = db.queryOne(
+  async desbloqueioTokenPorTecnico(tecnicoId) {
+    const r = await db.queryOne(
       `SELECT desbloqueio_token FROM pagamentos
        WHERE tecnico_id = ? AND status = 'approved' AND desbloqueio_token IS NOT NULL
        ORDER BY aprovado_em DESC LIMIT 1`,
@@ -582,8 +678,22 @@ const Pagamentos = {
    * usado no gráfico de crescimento do painel admin. Retorna
    * [{ mes: 'YYYY-MM', total: N }, ...]; meses sem aprovação
    * simplesmente não aparecem na lista (o chamador preenche 0).
+   *
+   * strftime()/datetime('now','-N months') são funções SQLite — o
+   * equivalente Postgres é to_char()/NOW() - INTERVAL, com sintaxe
+   * estruturalmente diferente o bastante para não caber num helper
+   * genérico só de substituição de texto.
    */
-  aprovadosPorMes(qtdMeses = 6) {
+  async aprovadosPorMes(qtdMeses = 6) {
+    if (USE_POSTGRES) {
+      return db.query(
+        `SELECT to_char(aprovado_em, 'YYYY-MM') as mes, COUNT(*) as total
+         FROM pagamentos
+         WHERE status = 'approved' AND aprovado_em >= NOW() - (? || ' months')::interval
+         GROUP BY mes`,
+        [String(qtdMeses)]
+      );
+    }
     return db.query(
       `SELECT strftime('%Y-%m', aprovado_em) as mes, COUNT(*) as total
        FROM pagamentos
@@ -593,35 +703,35 @@ const Pagamentos = {
     );
   },
 
-  totalAprovados() {
-    const r = db.queryOne("SELECT COUNT(*) as n FROM pagamentos WHERE status = 'approved'");
-    return r?.n || 0;
+  async totalAprovados() {
+    const r = await db.queryOne("SELECT COUNT(*) as n FROM pagamentos WHERE status = 'approved'");
+    return Number(r?.n || 0);
   },
 };
 
 // ── REPOSITÓRIO: Avaliações ───────────────────────────────────────
 const Avaliacoes = {
-  listarPorTecnico(tecnicoId) {
+  async listarPorTecnico(tecnicoId) {
     return db.query(
       'SELECT id, autor_nome, texto, nota, criado_em FROM avaliacoes WHERE tecnico_id = ? ORDER BY criado_em DESC',
       [tecnicoId]
     );
   },
 
-  criar({ tecnicoId, autorNome, texto, nota, ip }) {
+  async criar({ tecnicoId, autorNome, texto, nota, ip }) {
     const ipHash = hashSensivel(ip);
     return db.run(
       `INSERT INTO avaliacoes (tecnico_id, autor_nome, texto, nota, ip_hash)
-       VALUES (?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?) RETURNING id`,
       [tecnicoId, autorNome, texto, nota, ipHash]
     );
   },
 
-  jaAvaliouHoje(tecnicoId, ip) {
+  async jaAvaliouHoje(tecnicoId, ip) {
     const ipHash = hashSensivel(ip);
-    const r = db.queryOne(
+    const r = await db.queryOne(
       `SELECT 1 FROM avaliacoes WHERE tecnico_id = ? AND ip_hash = ?
-       AND date(criado_em) = date('now')`,
+       AND ${db.condicaoHoje('criado_em')}`,
       [tecnicoId, ipHash]
     );
     return !!r;
@@ -630,42 +740,42 @@ const Avaliacoes = {
 
 // ── REPOSITÓRIO: Denúncias ────────────────────────────────────────
 const Denuncias = {
-  listar() {
+  async listar() {
     return db.query('SELECT * FROM denuncias ORDER BY criado_em DESC');
   },
 
-  criar({ tecnicoId, tecnicoNome, motivo, descricao, ip }) {
+  async criar({ tecnicoId, tecnicoNome, motivo, descricao, ip }) {
     const ipHash = hashSensivel(ip);
     return db.run(
       `INSERT INTO denuncias (tecnico_id, tecnico_nome, motivo, descricao, ip_hash)
-       VALUES (?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?) RETURNING id`,
       [tecnicoId, tecnicoNome, motivo, descricao || null, ipHash]
     );
   },
 
-  jaDenounciouHoje(tecnicoId, motivo, ip) {
+  async jaDenounciouHoje(tecnicoId, motivo, ip) {
     const ipHash = hashSensivel(ip);
-    const r = db.queryOne(
+    const r = await db.queryOne(
       `SELECT 1 FROM denuncias WHERE tecnico_id = ? AND motivo = ? AND ip_hash = ?
-       AND date(criado_em) = date('now')`,
+       AND ${db.condicaoHoje('criado_em')}`,
       [tecnicoId, motivo, ipHash]
     );
     return !!r;
   },
 
-  contarFalsosProfissionais(tecnicoId) {
-    const r = db.queryOne(
+  async contarFalsosProfissionais(tecnicoId) {
+    const r = await db.queryOne(
       `SELECT COUNT(*) as n FROM denuncias
        WHERE tecnico_id = ? AND motivo = 'falso_profissional' AND status = 'pendente'`,
       [tecnicoId]
     );
-    return r?.n || 0;
+    return Number(r?.n || 0);
   },
 
-  arquivar(id, resolucao, resolvidoPor = 'admin') {
+  async arquivar(id, resolucao, resolvidoPor = 'admin') {
     return db.run(
       `UPDATE denuncias SET status = 'arquivada', resolucao = ?,
-       resolvido_em = datetime('now'), resolvido_por = ? WHERE id = ?`,
+       resolvido_em = ${db.agora()}, resolvido_por = ? WHERE id = ?`,
       [resolucao, resolvidoPor, id]
     );
   },
@@ -673,70 +783,75 @@ const Denuncias = {
 
 // ── REPOSITÓRIO: Demandas ─────────────────────────────────────────
 const Demandas = {
-  listarAtivas() {
+  async listarAtivas() {
     return db.query(
       `SELECT id, produtor_nome, cultura, descricao, cidade, uf, canal, status, criado_em
-       FROM demandas WHERE status = 'ativa' AND expira_em > datetime('now')
+       FROM demandas WHERE status = 'ativa' AND expira_em > ${db.agora()}
        ORDER BY criado_em DESC`
       // contato_enc e contato_iv NUNCA retornados na listagem pública
     );
   },
 
-  criar({ produtorNome, cultura, descricao, cidade, uf, canal, contatoEnc, contatoIv, optin, ip }) {
+  async criar({ produtorNome, cultura, descricao, cidade, uf, canal, contatoEnc, contatoIv, optin, ip }) {
     const ipHash   = hashSensivel(ip);
     const expiraEm = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     return db.run(
       `INSERT INTO demandas
          (produtor_nome, cultura, descricao, cidade, uf, canal,
           contato_enc, contato_iv, optin_novidades, expira_em, ip_hash)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id`,
       [produtorNome, cultura, descricao, cidade, uf, canal,
        contatoEnc, contatoIv, optin ? 1 : 0, expiraEm, ipHash]
     );
   },
 
-  buscarContato(id) {
+  async buscarContato(id) {
     // Retorna dados de contato criptografados — desencripta no backend
     return db.queryOne('SELECT contato_enc, contato_iv, canal FROM demandas WHERE id = ?', [id]);
   },
 
-  registrarDesbloqueio(demandaId, tecnicoId, ip) {
+  /**
+   * INSERT OR IGNORE é sintaxe SQLite — equivalente Postgres é
+   * ON CONFLICT (...) DO NOTHING, alvo do conflito = UNIQUE(demanda_id, tecnico_id).
+   */
+  async registrarDesbloqueio(demandaId, tecnicoId, ip) {
     const ipHash = hashSensivel(ip);
-    return db.run(
-      'INSERT OR IGNORE INTO demanda_desbloqueios (demanda_id, tecnico_id, ip_hash) VALUES (?,?,?)',
-      [demandaId, tecnicoId, ipHash]
-    );
+    const sql = USE_POSTGRES
+      ? `INSERT INTO demanda_desbloqueios (demanda_id, tecnico_id, ip_hash) VALUES (?,?,?)
+         ON CONFLICT (demanda_id, tecnico_id) DO NOTHING`
+      : `INSERT OR IGNORE INTO demanda_desbloqueios (demanda_id, tecnico_id, ip_hash) VALUES (?,?,?)`;
+    return db.run(sql, [demandaId, tecnicoId, ipHash]);
   },
 
-  encerrar(id) {
+  async encerrar(id) {
     return db.run("UPDATE demandas SET status = 'encerrada' WHERE id = ?", [id]);
   },
 };
 
 // ── REPOSITÓRIO: Classificados ────────────────────────────────────
 const Classificados = {
-  listarAtivos() {
+  async listarAtivos() {
     return db.query(
       `SELECT id, empresa, titulo, descricao, wpp, icone, criado_em
-       FROM classificados WHERE status = 'ativo' AND expira_em > datetime('now')
+       FROM classificados WHERE status = 'ativo' AND expira_em > ${db.agora()}
        ORDER BY pago DESC, criado_em DESC`
     );
   },
 
-  contarPorIdent(identificador) {
-    const r = db.queryOne(
+  async contarPorIdent(identificador) {
+    const r = await db.queryOne(
       'SELECT COUNT(*) as n FROM classificados WHERE identificador = ?',
       [identificador]
     );
-    return r?.n || 0;
+    return Number(r?.n || 0);
   },
 
-  criar({ identificador, empresa, titulo, descricao, wpp, icone, pago, pagamentoId }) {
+  async criar({ identificador, empresa, titulo, descricao, wpp, icone, pago, pagamentoId }) {
     const expiraEm = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     return db.run(
       `INSERT INTO classificados
          (identificador, empresa, titulo, descricao, wpp, icone, pago, pagamento_id, expira_em)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?) RETURNING id`,
       [identificador, empresa, titulo, descricao, wpp, icone || '🏪', pago ? 1 : 0, pagamentoId || null, expiraEm]
     );
   },
@@ -744,33 +859,35 @@ const Classificados = {
   /**
    * Idempotência da confirmação de pagamento — se este pagamentoId já
    * publicou um anúncio antes, retorna o registro existente em vez de
-   * duplicar. Substitui a checagem manual em classificados.json.
+   * duplicar.
    */
-  buscarPorPagamentoId(pagamentoId) {
+  async buscarPorPagamentoId(pagamentoId) {
     return db.queryOne('SELECT * FROM classificados WHERE pagamento_id = ?', [pagamentoId]);
   },
 };
 
 // ── REPOSITÓRIO: Configurações ────────────────────────────────────
 const Configuracoes = {
-  get(chave) {
-    const r = db.queryOne('SELECT valor FROM configuracoes WHERE chave = ?', [chave]);
+  async get(chave) {
+    const r = await db.queryOne('SELECT valor FROM configuracoes WHERE chave = ?', [chave]);
     return r?.valor;
   },
 
-  set(chave, valor) {
+  async set(chave, valor) {
     return db.run(
       `INSERT INTO configuracoes (chave, valor, atualizado_em)
-       VALUES (?, ?, datetime('now'))
+       VALUES (?, ?, ${db.agora()})
        ON CONFLICT(chave) DO UPDATE SET valor = excluded.valor, atualizado_em = excluded.atualizado_em`,
       [chave, String(valor)]
     );
   },
 
-  precos() {
+  async precos() {
+    const premiumRaw      = await this.get('preco_premium');
+    const classificadoRaw = await this.get('preco_classificado');
     return {
-      premium:      parseFloat(this.get('preco_premium')      || '49.90'),
-      classificado: parseFloat(this.get('preco_classificado') || '29.90'),
+      premium:      parseFloat(premiumRaw      || '49.90'),
+      classificado: parseFloat(classificadoRaw || '29.90'),
     };
   },
 
@@ -779,61 +896,61 @@ const Configuracoes = {
    * preços na tabela `configuracoes`. Validação de faixa (R$1–999) fica
    * a cargo de quem chama (a rota), igual ao comportamento anterior.
    */
-  definirPrecos(premium, classificado) {
-    this.set('preco_premium', premium);
-    this.set('preco_classificado', classificado);
+  async definirPrecos(premium, classificado) {
+    await this.set('preco_premium', premium);
+    await this.set('preco_classificado', classificado);
     return this.precos();
   },
 };
 
 // ── REPOSITÓRIO: Avisos ───────────────────────────────────────────
 const Avisos = {
-  ativo() {
+  async ativo() {
     return db.queryOne('SELECT texto FROM avisos WHERE ativo = 1 ORDER BY criado_em DESC LIMIT 1');
   },
 
-  publicar(texto) {
-    db.run('UPDATE avisos SET ativo = 0 WHERE ativo = 1'); // desativa o anterior
-    return db.run('INSERT INTO avisos (texto) VALUES (?)', [texto]);
+  async publicar(texto) {
+    await db.run('UPDATE avisos SET ativo = 0 WHERE ativo = 1'); // desativa o anterior
+    return db.run('INSERT INTO avisos (texto) VALUES (?) RETURNING id', [texto]);
   },
 
-  remover() {
+  async remover() {
     return db.run('UPDATE avisos SET ativo = 0 WHERE ativo = 1');
   },
 };
 
 // ── REPOSITÓRIO: Sessões Admin ────────────────────────────────────
 const AdminSessoes = {
-  criar(ip, ttlMs = 8 * 60 * 60 * 1000) {
+  async criar(ip, ttlMs = 8 * 60 * 60 * 1000) {
     const token   = crypto.randomUUID();
     const ipHash  = hashSensivel(ip);
     const expiraEm = new Date(Date.now() + ttlMs).toISOString();
-    db.run(
+    await db.run(
       'INSERT INTO admin_sessoes (token, ip_hash, expira_em) VALUES (?,?,?)',
       [token, ipHash, expiraEm]
     );
     return token;
   },
 
-  validar(token) {
-    const r = db.queryOne(
-      "SELECT 1 FROM admin_sessoes WHERE token = ? AND expira_em > datetime('now')",
+  async validar(token) {
+    const r = await db.queryOne(
+      `SELECT 1 FROM admin_sessoes WHERE token = ? AND expira_em > ${db.agora()}`,
       [token]
     );
     return !!r;
   },
 
-  revogar(token) {
+  async revogar(token) {
     return db.run('DELETE FROM admin_sessoes WHERE token = ?', [token]);
   },
 };
 
 // ── REPOSITÓRIO: Pedidos de Técnico ──────────────────────────────
 const PedidosTecnico = {
-  criar({ nome, whatsapp, necessidade, cidade, especialidade }) {
+  async criar({ nome, whatsapp, necessidade, cidade, especialidade }) {
     return db.run(
       `INSERT INTO pedidos_tecnico (nome, whatsapp, necessidade, cidade, especialidade)
-       VALUES (?,?,?,?,?)`,
+       VALUES (?,?,?,?,?) RETURNING id`,
       [nome, whatsapp, necessidade, cidade || null, especialidade || null]
     );
   },
@@ -845,6 +962,7 @@ const PedidosTecnico = {
 module.exports = {
   db,
   hashSensivel,
+  USE_POSTGRES,
   Produtores,
   Tecnicos,
   TecnicoSessoes,
