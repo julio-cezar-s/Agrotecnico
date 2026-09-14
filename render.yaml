@@ -1,0 +1,92 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  AgroTécnico — Render Blueprint                                  ║
+# ║                                                                    ║
+# ║  Deploy: conecte este repositório no Render → "New" → "Blueprint" ║
+# ║  → selecione o repo → o Render lê este arquivo e cria o serviço   ║
+# ║  automaticamente. Todo push na branch principal reimplanta.       ║
+# ╚══════════════════════════════════════════════════════════════════╝
+#
+# VARIÁVEIS COM sync: false — preencha no painel do Render depois que
+# o serviço for criado (Dashboard → seu serviço → Environment):
+#   MP_ACCESS_TOKEN, MP_WEBHOOK_SECRET  → painel do Mercado Pago
+#   DATABASE_URL                        → connection string do Neon
+#   ADMIN_SENHA                         → escolha uma senha forte sua
+#   SITE_URL, WEBHOOK_URL, FRONTEND_ORIGIN → a URL que o Render atribuir
+#     (ex: https://agrotecnico.onrender.com) — só se sabe depois do 1º deploy
+#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
+#     → Cloudflare dashboard → R2 → Manage API Tokens → criar token
+#       com permissão de leitura/escrita nos dois buckets abaixo
+#   R2_BUCKET_AVATARS, R2_BUCKET_DOCUMENTOS
+#     → nomes dos dois buckets criados no R2 (ex: agrotecnico-avatars,
+#       agrotecnico-documentos) — o de documentos deve ficar SEM
+#       acesso público habilitado
+#   R2_PUBLIC_URL_AVATARS
+#     → domínio público do bucket de avatares (subdomínio r2.dev
+#       habilitado em Settings → Public Access, ou domínio próprio)
+#
+# IMPORTANTE (auditoria 20/07/2026): desde o endurecimento de boot em
+# server.js, o processo agora RECUSA subir em produção se ADMIN_SENHA,
+# HASH_SECRET, FRONTEND_ORIGIN, MP_WEBHOOK_SECRET ou qualquer uma das
+# variáveis do R2 acima estiverem ausentes. Preencha todas antes do
+# primeiro deploy — sem elas o serviço não inicia.
+
+services:
+  - type: web
+    name: agrotecnico
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      - key: MP_ACCESS_TOKEN
+        sync: false
+      - key: MP_WEBHOOK_SECRET
+        sync: false
+
+      - key: DATABASE_URL
+        sync: false
+      - key: DB_SSL
+        value: "true"
+
+      # Gerados automaticamente pelo Render no formato exigido por
+      # cripto-contato.js (256 bits em base64 = exatamente 32 bytes).
+      - key: HASH_SECRET
+        generateValue: true
+      - key: CONTATO_ENC_KEY
+        generateValue: true
+
+      - key: ADMIN_EMAIL
+        value: admin@agrotecnico.com.br
+      - key: ADMIN_SENHA
+        sync: false
+      - key: ADMIN_LEGACY_BEARER
+        value: "false"
+
+      - key: SITE_URL
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+
+      # Storage externo (Cloudflare R2) — substitui o filesystem local,
+      # que é efêmero no plano free do Render (some a cada redeploy).
+      # Ver comentário no topo deste arquivo para onde encontrar cada valor.
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_AVATARS
+        sync: false
+      - key: R2_BUCKET_DOCUMENTOS
+        sync: false
+      - key: R2_PUBLIC_URL_AVATARS
+        sync: false
